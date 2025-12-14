@@ -365,6 +365,46 @@ HTML_TEMPLATE = '''
             });
         });
 
+        // Add scroll navigation
+        lightbox.on('afterInit', () => {
+            const pswp = lightbox.pswp;
+            let scrollTimeout;
+
+            const handleWheel = (e) => {
+                // Check if zoomed in
+                const currZoomLevel = pswp.currSlide.currZoomLevel || 1;
+                const isZoomed = currZoomLevel > 1;
+
+                // Only navigate if not zoomed in
+                if (isZoomed) {
+                    return;
+                }
+
+                e.preventDefault();
+                e.stopPropagation();
+
+                clearTimeout(scrollTimeout);
+                scrollTimeout = setTimeout(() => {
+                    if (e.deltaY > 0) {
+                        // Scroll down - next image
+                        pswp.next();
+                    } else if (e.deltaY < 0) {
+                        // Scroll up - previous image
+                        pswp.prev();
+                    }
+                }, 50);
+            };
+
+            // Add wheel event listener to the main element
+            pswp.element.addEventListener('wheel', handleWheel, { passive: false });
+
+            // Clean up on close
+            pswp.on('destroy', () => {
+                pswp.element.removeEventListener('wheel', handleWheel);
+                clearTimeout(scrollTimeout);
+            });
+        });
+
         lightbox.init();
 
         // Re-initialize lightbox when filter changes
