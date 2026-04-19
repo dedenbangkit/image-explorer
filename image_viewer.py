@@ -8,8 +8,10 @@ import os
 import sys
 import mimetypes
 import socket
+import subprocess
+import json
 from pathlib import Path
-from flask import Flask, render_template_string, send_from_directory
+from flask import Flask, render_template_string, send_from_directory, jsonify, request
 from PIL import Image
 
 app = Flask(__name__)
@@ -17,8 +19,22 @@ app = Flask(__name__)
 # Supported image extensions
 IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.svg', '.ico'}
 
+# Supported video extensions
+VIDEO_EXTENSIONS = {'.mp4', '.webm', '.mov', '.avi', '.mkv', '.m4v', '.ogv'}
+
+# All supported media extensions
+MEDIA_EXTENSIONS = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
+
 # Global variable to store the base directory
 BASE_DIR = None
+
+# Config paths from config.json
+CONFIG_PATHS = []
+CURRENT_PATH_INDEX = 0
+
+# Cached data (populated at startup)
+CACHED_MEDIA = None
+CACHED_FOLDERS = None
 
 # HTML template with PhotoSwipe library
 HTML_TEMPLATE = '''
@@ -176,11 +192,90 @@ HTML_TEMPLATE = '''
         .gallery-item.hidden {
             display: none;
         }
-        .gallery-item img {
+        .gallery-item img,
+        .gallery-item video {
             width: 100%;
             height: 200px;
             object-fit: cover;
             display: block;
+        }
+        .gallery-item .video-thumbnail {
+            position: relative;
+        }
+        .gallery-item .play-icon {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            width: 60px;
+            height: 60px;
+            background: rgba(0,0,0,0.7);
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            pointer-events: none;
+        }
+        .gallery-item .play-icon::after {
+            content: '';
+            width: 0;
+            height: 0;
+            border-left: 20px solid white;
+            border-top: 12px solid transparent;
+            border-bottom: 12px solid transparent;
+            margin-left: 5px;
+        }
+        .video-modal {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0,0,0,0.95);
+            z-index: 2000;
+            align-items: center;
+            justify-content: center;
+        }
+        .video-modal.active {
+            display: flex;
+        }
+        .video-modal video {
+            max-width: 90%;
+            max-height: 90%;
+        }
+        .video-modal .close-btn {
+            position: absolute;
+            top: 20px;
+            right: 30px;
+            font-size: 40px;
+            color: white;
+            cursor: pointer;
+            z-index: 2001;
+        }
+        .video-modal .nav-btn {
+            position: absolute;
+            top: 50%;
+            transform: translateY(-50%);
+            font-size: 50px;
+            color: white;
+            cursor: pointer;
+            padding: 20px;
+            user-select: none;
+        }
+        .video-modal .nav-btn.prev { left: 20px; }
+        .video-modal .nav-btn.next { right: 20px; }
+        .video-modal .nav-btn:hover { color: #ccc; }
+        .video-modal .video-caption {
+            position: absolute;
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: rgba(0,0,0,0.75);
+            color: white;
+            padding: 10px 20px;
+            border-radius: 5px;
+            font-size: 14px;
         }
         .image-info {
             padding: 10px;
@@ -204,6 +299,20 @@ HTML_TEMPLATE = '''
             padding: 40px;
             font-size: 14px;
         }
+        .path-selector {
+            width: 100%;
+            padding: 8px 10px;
+            border: 1px solid #ddd;
+            border-radius: 6px;
+            font-size: 13px;
+            background: white;
+            cursor: pointer;
+            margin-top: 10px;
+        }
+        .path-selector:focus {
+            outline: none;
+            border-color: #1976d2;
+        }
     </style>
 </head>
 <body>
@@ -212,7 +321,14 @@ HTML_TEMPLATE = '''
         <div class="sidebar-toggle" id="sidebarToggle">☰</div>
         <div class="sidebar-header">
             <div class="sidebar-title">Folders</div>
-            <div class="sidebar-subtitle">{{ images|length }} total images</div>
+            <div class="sidebar-subtitle">{{ images|length }} total files</div>
+            {% if config_paths|length > 1 %}
+            <select class="path-selector" id="pathSelector">
+                {% for p in config_paths %}
+                <option value="{{ loop.index0 }}" {% if loop.index0 == current_path_index %}selected{% endif %}>{{ p.name }}</option>
+                {% endfor %}
+            </select>
+            {% endif %}
         </div>
         <div class="folder-tree">
             {% for folder in folders %}
@@ -229,31 +345,50 @@ HTML_TEMPLATE = '''
 
     <!-- Main Content -->
     <div class="main-content">
-        <h1>Image Viewer</h1>
-        <div class="info">
-            <strong>Base Folder:</strong> {{ base_path }}<br>
-            <strong>Current Filter:</strong> <span class="current-folder" id="currentFolder">All Folders</span><br>
-            <strong>Showing:</strong> <span id="imageCount">{{ images|length }}</span> image(s)
-        </div>
-
         <div class="gallery" id="gallery">
             {% for img in images %}
+            {% if img.is_video %}
+            <div class="gallery-item video-item"
+                 data-folder="{{ img.folder }}"
+                 data-url="{{ img.url }}"
+                 data-path="{{ img.rel_path }}"
+                 data-width="{{ img.width }}"
+                 data-height="{{ img.height }}">
+                <div class="video-thumbnail">
+                    <video src="{{ img.url }}" preload="metadata" muted></video>
+                    <div class="play-icon"></div>
+                </div>
+                <div class="image-info">
+                    <div class="image-path" title="{{ img.rel_path }}">{{ img.rel_path }}</div>
+                </div>
+            </div>
+            {% else %}
             <a href="{{ img.url }}"
                data-pswp-width="{{ img.width }}"
                data-pswp-height="{{ img.height }}"
                data-folder="{{ img.folder }}"
-               class="gallery-item"
+               class="gallery-item image-item"
                target="_blank">
                 <img src="{{ img.url }}" alt="{{ img.name }}" loading="lazy">
                 <div class="image-info">
                     <div class="image-path" title="{{ img.rel_path }}">{{ img.rel_path }}</div>
                 </div>
             </a>
+            {% endif %}
             {% endfor %}
         </div>
         <div class="no-images" id="noImages" style="display: none;">
-            No images in this folder
+            No media in this folder
         </div>
+    </div>
+
+    <!-- Video Modal -->
+    <div class="video-modal" id="videoModal">
+        <span class="close-btn" id="closeVideo">&times;</span>
+        <span class="nav-btn prev" id="prevVideo">&#10094;</span>
+        <span class="nav-btn next" id="nextVideo">&#10095;</span>
+        <video id="modalVideo" controls></video>
+        <div class="video-caption" id="videoCaption"></div>
     </div>
 
     <script>
@@ -266,11 +401,17 @@ HTML_TEMPLATE = '''
             sidebarToggle.textContent = sidebar.classList.contains('collapsed') ? '☰' : '✕';
         });
 
+        // Path selector
+        const pathSelector = document.getElementById('pathSelector');
+        if (pathSelector) {
+            pathSelector.addEventListener('change', () => {
+                window.location.href = '/switch/' + pathSelector.value;
+            });
+        }
+
         // Folder filtering
         const folderItems = document.querySelectorAll('.folder-item');
         const galleryItems = document.querySelectorAll('.gallery-item');
-        const currentFolderEl = document.getElementById('currentFolder');
-        const imageCountEl = document.getElementById('imageCount');
         const noImagesEl = document.getElementById('noImages');
         const galleryEl = document.getElementById('gallery');
         let currentFilter = '.';
@@ -296,8 +437,6 @@ HTML_TEMPLATE = '''
                 }
             });
 
-            imageCountEl.textContent = visibleCount;
-
             if (visibleCount === 0) {
                 galleryEl.style.display = 'none';
                 noImagesEl.style.display = 'block';
@@ -313,17 +452,97 @@ HTML_TEMPLATE = '''
                 folderItems.forEach(f => f.classList.remove('active'));
                 item.classList.add('active');
 
-                // Get folder path and name
+                // Get folder path
                 const folderPath = item.getAttribute('data-folder');
-                const folderName = item.querySelector('.folder-name').textContent;
-
-                // Update current folder display
-                currentFolderEl.textContent = folderPath === '.' ? 'All Folders' : folderName;
 
                 // Filter images
                 filterImages(folderPath);
             });
         });
+
+        // Video modal handling
+        const videoModal = document.getElementById('videoModal');
+        const modalVideo = document.getElementById('modalVideo');
+        const videoCaption = document.getElementById('videoCaption');
+        const closeVideo = document.getElementById('closeVideo');
+        const prevVideo = document.getElementById('prevVideo');
+        const nextVideo = document.getElementById('nextVideo');
+        let currentVideoIndex = 0;
+        let visibleVideos = [];
+
+        function updateVisibleVideos() {
+            visibleVideos = Array.from(document.querySelectorAll('.video-item:not(.hidden)'));
+        }
+
+        function openVideo(index) {
+            updateVisibleVideos();
+            if (visibleVideos.length === 0) return;
+
+            currentVideoIndex = index;
+            const videoItem = visibleVideos[index];
+            const url = videoItem.getAttribute('data-url');
+            const path = videoItem.getAttribute('data-path');
+
+            modalVideo.src = url;
+            videoCaption.textContent = path;
+            videoModal.classList.add('active');
+            document.body.style.overflow = 'hidden';
+
+            // Update nav visibility
+            prevVideo.style.display = currentVideoIndex > 0 ? 'block' : 'none';
+            nextVideo.style.display = currentVideoIndex < visibleVideos.length - 1 ? 'block' : 'none';
+        }
+
+        function closeVideoModal() {
+            videoModal.classList.remove('active');
+            modalVideo.pause();
+            modalVideo.src = '';
+            document.body.style.overflow = '';
+        }
+
+        document.querySelectorAll('.video-item').forEach(item => {
+            item.addEventListener('click', () => {
+                updateVisibleVideos();
+                const index = visibleVideos.indexOf(item);
+                if (index >= 0) openVideo(index);
+            });
+        });
+
+        closeVideo.addEventListener('click', closeVideoModal);
+
+        prevVideo.addEventListener('click', () => {
+            if (currentVideoIndex > 0) openVideo(currentVideoIndex - 1);
+        });
+
+        nextVideo.addEventListener('click', () => {
+            if (currentVideoIndex < visibleVideos.length - 1) openVideo(currentVideoIndex + 1);
+        });
+
+        videoModal.addEventListener('click', (e) => {
+            if (e.target === videoModal) closeVideoModal();
+        });
+
+        document.addEventListener('keydown', (e) => {
+            if (!videoModal.classList.contains('active')) return;
+            if (e.key === 'Escape') closeVideoModal();
+            if (e.key === 'ArrowLeft' && currentVideoIndex > 0) openVideo(currentVideoIndex - 1);
+            if (e.key === 'ArrowRight' && currentVideoIndex < visibleVideos.length - 1) openVideo(currentVideoIndex + 1);
+        });
+
+        // Scroll navigation for video modal
+        let videoScrollTimeout;
+        videoModal.addEventListener('wheel', (e) => {
+            if (!videoModal.classList.contains('active')) return;
+            e.preventDefault();
+            clearTimeout(videoScrollTimeout);
+            videoScrollTimeout = setTimeout(() => {
+                if (e.deltaY > 0 && currentVideoIndex < visibleVideos.length - 1) {
+                    openVideo(currentVideoIndex + 1);
+                } else if (e.deltaY < 0 && currentVideoIndex > 0) {
+                    openVideo(currentVideoIndex - 1);
+                }
+            }, 50);
+        }, { passive: false });
     </script>
 
     <script type="module">
@@ -331,7 +550,7 @@ HTML_TEMPLATE = '''
 
         const lightbox = new PhotoSwipeLightbox({
             gallery: '#gallery',
-            children: 'a:not(.hidden)',
+            children: 'a.image-item:not(.hidden)',
             pswpModule: () => import('https://cdnjs.cloudflare.com/ajax/libs/photoswipe/5.3.8/photoswipe.esm.min.js'),
             padding: { top: 50, bottom: 50, left: 50, right: 50 },
             bgOpacity: 0.9,
@@ -422,6 +641,28 @@ HTML_TEMPLATE = '''
 '''
 
 
+def get_video_dimensions(file_path):
+    """Get video dimensions using ffprobe"""
+    try:
+        result = subprocess.run(
+            [
+                'ffprobe', '-v', 'quiet', '-print_format', 'json',
+                '-show_streams', '-select_streams', 'v:0', str(file_path)
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        if result.returncode == 0:
+            data = json.loads(result.stdout)
+            if data.get('streams'):
+                stream = data['streams'][0]
+                return stream.get('width', 800), stream.get('height', 600)
+    except (subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError):
+        pass
+    return 800, 600  # Default dimensions
+
+
 def build_folder_tree(directory):
     """Build a hierarchical folder tree structure"""
     base_path = Path(directory).resolve()
@@ -431,8 +672,8 @@ def build_folder_tree(directory):
         dirs.sort()
         files.sort()
 
-        # Count images in this folder
-        image_count = sum(1 for f in files if Path(f).suffix.lower() in IMAGE_EXTENSIONS)
+        # Count media files in this folder
+        image_count = sum(1 for f in files if Path(f).suffix.lower() in MEDIA_EXTENSIONS)
 
         if root == str(base_path):
             folder_tree['image_count'] = image_count
@@ -470,9 +711,9 @@ def folder_tree_to_list(tree, level=0):
     return result
 
 
-def scan_images(directory):
-    """Recursively scan directory for images"""
-    images = []
+def scan_media(directory):
+    """Recursively scan directory for images and videos"""
+    media = []
     base_path = Path(directory).resolve()
 
     for root, dirs, files in os.walk(directory):
@@ -484,49 +725,71 @@ def scan_images(directory):
             file_path = Path(root) / file
             ext = file_path.suffix.lower()
 
-            if ext in IMAGE_EXTENSIONS:
+            if ext in MEDIA_EXTENSIONS:
                 rel_path = file_path.relative_to(base_path)
                 folder_path = str(rel_path.parent) if rel_path.parent != Path('.') else '.'
 
-                # Get image dimensions
-                width, height = 800, 600  # Default values
-                try:
-                    with Image.open(file_path) as img:
-                        width, height = img.size
-                except Exception:
-                    # If we can't read the image, use defaults
-                    pass
+                is_video = ext in VIDEO_EXTENSIONS
 
-                images.append({
+                # Get dimensions (skip for videos - use defaults)
+                width, height = 800, 600  # Default values
+                if not is_video:
+                    try:
+                        with Image.open(file_path) as img:
+                            width, height = img.size
+                    except Exception:
+                        pass
+
+                media.append({
                     'name': file,
                     'path': str(file_path),
                     'rel_path': str(rel_path),
                     'folder': folder_path,
-                    'url': f'/image/{rel_path}',
+                    'url': f'/media/{rel_path}',
                     'width': width,
-                    'height': height
+                    'height': height,
+                    'is_video': is_video,
+                    'type': 'video' if is_video else 'image'
                 })
 
-    return images
+    return media
 
 
 @app.route('/')
 def index():
-    """Main page showing image gallery"""
-    images = scan_images(BASE_DIR)
-    folder_tree = build_folder_tree(BASE_DIR)
-    folders = folder_tree_to_list(folder_tree)
+    """Main page showing media gallery"""
     return render_template_string(
         HTML_TEMPLATE,
-        images=images,
-        folders=folders,
-        base_path=BASE_DIR
+        images=CACHED_MEDIA,
+        folders=CACHED_FOLDERS,
+        config_paths=CONFIG_PATHS,
+        current_path_index=CURRENT_PATH_INDEX
     )
 
 
-@app.route('/image/<path:filepath>')
-def serve_image(filepath):
-    """Serve image files"""
+@app.route('/switch/<int:path_index>')
+def switch_path(path_index):
+    """Switch to a different configured path"""
+    global BASE_DIR, CACHED_MEDIA, CACHED_FOLDERS, CURRENT_PATH_INDEX
+
+    if path_index < 0 or path_index >= len(CONFIG_PATHS):
+        return "Invalid path index", 400
+
+    CURRENT_PATH_INDEX = path_index
+    path_config = CONFIG_PATHS[path_index]
+    BASE_DIR = str(Path(path_config['path']).expanduser().resolve())
+
+    # Re-scan the new path
+    CACHED_MEDIA = scan_media(BASE_DIR)
+    folder_tree = build_folder_tree(BASE_DIR)
+    CACHED_FOLDERS = folder_tree_to_list(folder_tree)
+
+    return index()
+
+
+@app.route('/media/<path:filepath>')
+def serve_media(filepath):
+    """Serve image and video files"""
     full_path = Path(BASE_DIR) / filepath
     directory = str(full_path.parent)
     filename = full_path.name
@@ -545,34 +808,53 @@ def find_available_port(start_port=5000, max_port=5100):
     raise RuntimeError(f"No available ports found between {start_port} and {max_port}")
 
 
-def main():
-    global BASE_DIR
+def load_config():
+    """Load configuration from config.json"""
+    config_path = Path(__file__).parent / 'config.json'
+    if config_path.exists():
+        with open(config_path, 'r') as f:
+            config = json.load(f)
+            return config.get('paths', [])
+    return []
 
-    # Get directory from command line argument or use current directory
+
+def main():
+    global BASE_DIR, CACHED_MEDIA, CACHED_FOLDERS, CONFIG_PATHS, CURRENT_PATH_INDEX
+
+    # Load config
+    CONFIG_PATHS = load_config()
+
+    # Get directory from command line argument, config, or current directory
     if len(sys.argv) > 1:
         BASE_DIR = sys.argv[1]
+    elif CONFIG_PATHS:
+        BASE_DIR = CONFIG_PATHS[0]['path']
+        CURRENT_PATH_INDEX = 0
     else:
         BASE_DIR = os.getcwd()
+
+    # Expand ~ and resolve path
+    BASE_DIR = str(Path(BASE_DIR).expanduser().resolve())
 
     # Validate directory
     if not os.path.isdir(BASE_DIR):
         print(f"Error: '{BASE_DIR}' is not a valid directory")
         sys.exit(1)
 
-    BASE_DIR = str(Path(BASE_DIR).resolve())
+    # Scan and cache media files at startup
+    print(f"\nScanning {BASE_DIR}...")
+    CACHED_MEDIA = scan_media(BASE_DIR)
+    folder_tree = build_folder_tree(BASE_DIR)
+    CACHED_FOLDERS = folder_tree_to_list(folder_tree)
 
-    # Count images
-    images = scan_images(BASE_DIR)
-    print(f"\n{'='*60}")
-    print(f"Image Viewer")
-    print(f"{'='*60}")
-    print(f"Scanning: {BASE_DIR}")
-    print(f"Found: {len(images)} image(s)")
-    print(f"{'='*60}\n")
+    image_count = sum(1 for m in CACHED_MEDIA if not m['is_video'])
+    video_count = sum(1 for m in CACHED_MEDIA if m['is_video'])
+    print(f"Found: {image_count} image(s), {video_count} video(s)")
 
-    if len(images) == 0:
-        print("No images found in the directory.")
-        print(f"Supported formats: {', '.join(sorted(IMAGE_EXTENSIONS))}")
+    if len(CACHED_MEDIA) == 0:
+        print("No media files found in the directory.")
+        print(f"Supported image formats: {', '.join(sorted(IMAGE_EXTENSIONS))}")
+        print(f"Supported video formats: {', '.join(sorted(VIDEO_EXTENSIONS))}")
         sys.exit(0)
 
     # Find available port

@@ -1,0 +1,6 @@
+{
+  "paths": [
+    {"name": "Videos", "path": "~/Videos"},
+    {"name": "Pictures", "path": "~/Pictures"}
+  ]
+}
